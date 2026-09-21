@@ -43,6 +43,8 @@ env:
   AVBTOOL_URL: https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT
   KERNEL_REPO: https://github.com/LineageOS/android_kernel_oneplus_sm8150
   KERNEL_BRANCH: lineage-23.2
+  # Same commit as the official 20260920 build manifest.
+  KERNEL_COMMIT: 0521dc291cf10bd754fb5ff385e74875c406d577
   # prebuilts/clang/host/linux-x86/clang-r563880 (clang 21.0.0) — the exact
   # toolchain used for the official LineageOS 23.2 sm8150 kernel.
   #
@@ -53,11 +55,13 @@ env:
   # r563880c, NOT r563880: the official kernel banner reports clang build
   # 14054515, which is r563880c. r563880 differs (13783749) and, with LTO +
   # Shadow Call Stack, can produce an image that hangs early in boot.
-  CLANG_TARBALL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/clang-r563880c.tar.gz
-  GCC64_REPO: https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9
-  GCC64_BRANCH: lineage-19.1
-  GCC32_REPO: https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9
-  GCC32_BRANCH: lineage-19.1
+  #
+  # Exact prebuilt revision from the 20260920 official build manifest.
+  #
+  # The stock rebuild only booted once the build became pure LLVM
+  # (TARGET_KERNEL_NO_GCC := true). The GCC cross toolchains used to be put on
+  # PATH here, which silently broke the result.
+  CLANG_TARBALL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/9916fb51ccb914d62d35ad9a7b9b21d2ef046928/clang-r563880c.tar.gz
   KSU_TAG: ${{ github.event.inputs.ksu_tag || 'legacy' }}
 
 jobs:
@@ -108,8 +112,10 @@ jobs:
       - name: Fetch kernel source
         run: |
           set -euxo pipefail
-          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
+          git clone --depth=1 "$KERNEL_REPO" kernel
           cd kernel
+          git fetch --depth=1 origin "$KERNEL_COMMIT"
+          git checkout --detach FETCH_HEAD
           git log --oneline -1
           git config user.name  "guacamoleb CI"
           git config user.email "ci@localhost"
@@ -129,7 +135,7 @@ jobs:
           path: toolchain
           # bump this key whenever CLANG_TARBALL changes, otherwise the old
           # toolchain is restored from cache and silently used.
-          key: toolchain-clang-r563880c-gcc49-v1
+          key: toolchain-clang-r563880c-manifest-9916fb5-v1
 
       - name: Fetch toolchains
         run: |
@@ -138,8 +144,6 @@ jobs:
           cd "$GITHUB_WORKSPACE/toolchain"
 
           CLANG_DIR="$GITHUB_WORKSPACE/toolchain/clang"
-          GCC64_DIR="$GITHUB_WORKSPACE/toolchain/gcc64"
-          GCC32_DIR="$GITHUB_WORKSPACE/toolchain/gcc32"
 
           if [ ! -x "$CLANG_DIR/bin/clang" ]; then
             # clang: AOSP prebuilt tarball (no git-lfs pitfalls). ~1.1 GB.
@@ -152,13 +156,7 @@ jobs:
             echo 'clang restored from cache'
           fi
 
-          # GCC cross toolchains (real files, no lfs).
-          [ -d "$GCC64_DIR" ] || git clone --depth=1 -b "$GCC64_BRANCH" "$GCC64_REPO" gcc64 >/dev/null 2>&1
-          [ -d "$GCC32_DIR" ] || git clone --depth=1 -b "$GCC32_BRANCH" "$GCC32_REPO" gcc32 >/dev/null 2>&1
-
           echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_ENV"
-          echo "GCC64_DIR=$GCC64_DIR" >> "$GITHUB_ENV"
-          echo "GCC32_DIR=$GCC32_DIR" >> "$GITHUB_ENV"
 
           # be defensive: restore exec bits if the archive lost them
           chmod -R u+rwX,go+rX "$CLANG_DIR"
@@ -166,8 +164,6 @@ jobs:
 
           # Sanity check the toolchain before the long build.
           "$CLANG_DIR/bin/clang" --version | head -1
-          "$GCC64_DIR/bin/aarch64-linux-android-gcc" --version | head -1
-          "$GCC32_DIR/bin/arm-linux-androideabi-gcc" --version | head -1
 
       - name: Set up KernelSU-Next (${{ env.KSU_TAG }})
         if: ${{ github.event.inputs.build_ksu != 'false' }}
@@ -204,7 +200,7 @@ jobs:
         working-directory: kernel
         run: |
           set -uxo pipefail
-          export PATH="$CLANG_DIR/bin:$GCC64_DIR/bin:$GCC32_DIR/bin:$PATH"
+          export PATH="$CLANG_DIR/bin:$PATH"
 
           # 1. official config straight out of the shipped kernel
           python3 "$GITHUB_WORKSPACE/scripts/extract_config.py" \
@@ -272,8 +268,7 @@ jobs:
         working-directory: kernel
         run: |
           set -uxo pipefail
-          export PATH="$GCC64_DIR/bin:$GCC32_DIR/bin:$PATH"
-          export PATH="$PATH:$CLANG_DIR/bin"
+          export PATH="$CLANG_DIR/bin:$PATH"
 
           cp "$GITHUB_WORKSPACE/scripts/kmake.sh" .
 
