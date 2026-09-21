@@ -4,14 +4,22 @@ Builds a flashable **boot.img** for `guacamoleb` from the **LineageOS 23.2**
 kernel source, with **KernelSU-Next (legacy, non-GKI, manual hooks)** compiled in,
 plus the matching rebuilt kernel modules.
 
-Status: **build verified** — kernel release string, configuration and module
-vermagic all match the official LineageOS build.
+---
+
+## TL;DR — what you flash
+
+| step | file | how |
+|---|---|---|
+| 1 | `boot-guacamoleb-*.img` | `fastboot flash boot <file>` (PC required, once) |
+| 2 | `kernel-modules-ksu.zip` | KernelSU-Next Manager → Modules → Install (on device) |
+
+**Both are required.** Without the module zip Wi-Fi will not come up (see below).
 
 ---
 
 ## Why manual hooks
 
-The sm8150 kernel (4.14.357-openela) has:
+The sm8150 kernel (`4.14.357-openela`) has:
 
 ```
 CONFIG_KALLSYMS=y
@@ -21,13 +29,49 @@ CONFIG_KALLSYMS_ALL=y
 
 KernelSU-Next's default hook mode (`KSU_KPROBES_HOOK`) needs
 `KPROBES + KRETPROBES + HAVE_SYSCALL_TRACEPOINTS`. Since KPROBES is disabled,
-we use the **manual (in-tree) hook** mode (`KSU_MANUAL_HOOK=y`).
+the build uses the **manual (in-tree) hook** mode (`CONFIG_KSU_MANUAL_HOOK=y`).
 
-Also, the mainline KernelSU-Next line (>= v3.3.0) does **not** compile on 4.14:
+The mainline KernelSU-Next line (>= v3.3.0) does **not** compile on 4.14:
 `hook/syscall_hook.h` uses `syscall_fn_t`, which was introduced on arm64 only
-in 4.19. This build pins **`v3.2.0-legacy`**.
+in 4.19.
 
-## Why the kernel modules are shipped too
+## Why the `legacy` branch and not `v3.2.0-legacy`
+
+The pinned tag `v3.2.0-legacy` is from **2026-04-14**. The `legacy` branch has
+17 commits on top of it, including:
+
+* `f6a1570c` **2026-09-20** — *legacy: non-GKI update — **execveat (new
+  bionic)**, hardening, syscall table hooking*. Android 16's bionic maps
+  `execve`/`execv` to `execveat(AT_FDCWD, ...)`; the old tag does not handle
+  that, which is consistent with a hang very early in boot.
+* `13ad2b4c` — sucompat / `__init`/`__exit` fixes
+* `53791c92` — ABBA deadlock fix with `packages.list` rename
+
+### The one patch we must apply on top
+
+`legacy` does **not** build on 4.14 as-is:
+
+```
+drivers/kernelsu/sulog/event.c:67: error: incompatible pointer types passing
+  'struct timespec64 *' to parameter of type 'struct timespec *'
+```
+
+The guard is
+
+```c
+#if KERNEL_VERSION(4, 19, 0) <= LINUX_VERSION_CODE
+    ktime_get_boottime_ts64(&ts);
+#else
+    get_monotonic_boottime(&ts);   /* takes struct timespec on 4.14 */
+#endif
+```
+
+but 4.14 already provides `ktime_get_boottime_ts64()`
+(`include/linux/timekeeping.h`). `scripts/patch_ksu_tree.py` rewrites the
+block to always use the ts64 helper. It is idempotent and skips older tags
+that do not contain the file.
+
+## Why the kernel modules are shipped
 
 The official kernel builds the WLAN driver as a module:
 
@@ -40,12 +84,13 @@ CONFIG_MODVERSIONS=y       ->  symbol CRCs are tied to the exact build
 These modules are built **from the kernel tree during the ROM build**. Because
 `CONFIG_MODVERSIONS=y`, the copies in `/vendor` only load against the kernel
 they were built with. A custom kernel alone therefore breaks Wi-Fi
-(`disagrees about version of symbol module_layout` / no WLAN) — this is the
-failure described by other KernelSU builds for this SoC.
+(`disagrees about version of symbol module_layout`). The build rebuilds the
+modules and ships them in a **KernelSU module zip** that magic-mounts them over
+`/vendor/lib/modules`, so `/vendor` itself stays untouched (AVB-safe).
 
-This project rebuilds the modules and ships them in a **KernelSU module zip**
-that magic-mounts them over `/vendor/lib/modules`, so `/vendor` itself stays
-untouched (AVB-safe).
+Note the rename: the driver builds as `wlan.ko` but init loads it as
+`qca_cld3_wlan.ko` (`init.target.rc`). LineageOS does the same via
+`TARGET_MODULE_ALIASES`.
 
 ## Why the config comes from the official boot.img
 
@@ -68,23 +113,51 @@ The workflow instead:
 2. applies only the **KernelSU delta** (`scripts/apply_ksu_config.py`);
 3. runs every `make` through `scripts/kmake.sh`, which always passes clang.
 
-Result — the built config differs from the official one *only* by the intended
-KernelSU options:
+The resulting config differs from the official one **only** by the intended
+KernelSU options (7 lines).
+
+## Toolchain
+
+The official kernel banner reports:
 
 ```
-CONFIG_KSU=y
-CONFIG_KSU_MANUAL_HOOK=y
-CONFIG_OVERLAY_FS_REDIRECT_DIR=y
-# CONFIG_KSU_DEBUG is not set
-# CONFIG_KSU_KPROBES_HOOK is not set
+Android (14054515, +pgo, +bolt, +lto, +mlgo, ...) clang version 21.0.0
 ```
+
+`14054515` is **`clang-r563880c`**, not `clang-r563880` (which is `13783749`).
+With LTO + Shadow Call Stack a different clang can change early-boot code, so
+the build pins `r563880c` and **fails** if the produced kernel was not built
+with build id `14054515` (`scripts/artifact_info.py`).
+
+> When changing `CLANG_TARBALL`, bump the toolchain cache key in the workflow —
+> otherwise a stale toolchain is restored from cache.
+
+## AVB: the boot image is re-signed
+
+The embedded `vbmeta` struct sits immediately after the kernel/ramdisk/DTB
+body, and the AVB footer at the end of the image points at it. Since the custom
+kernel changes the body length, that struct moves. Copying the old AVB area
+leaves the footer pointing at garbage:
+
+```
+avbtool info_image --image boot.img
+-> "Given image does not look like a vbmeta image"
+```
+
+The workflow re-signs the image with `avbtool add_hash_footer`, reusing the
+salt / algorithm / properties of the original, and then **verifies** it. It
+also fails the build if verification does not pass.
+
+(`ro.boot.verifiedbootstate=orange` on these devices means verification is not
+enforced, so a stale footer is not necessarily fatal — but a valid image is
+free to produce and removes a whole class of failure.)
 
 ## Patches
 
-| patch | what |
+| file | what |
 |---|---|
-| `0001-defconfig-ksu.patch` | adds `CONFIG_KSU`, `CONFIG_KSU_MANUAL_HOOK` and overlayfs options |
-| `0002-manual-hooks.patch` | inserts `ksu_handle_*` calls into 6 kernel files behind `#ifdef CONFIG_KSU` |
+| `patches/0001-defconfig-ksu.patch` | adds `CONFIG_KSU`, `CONFIG_KSU_MANUAL_HOOK` and overlayfs options |
+| `patches/0002-manual-hooks.patch` | inserts `ksu_handle_*` calls into 6 kernel files behind `#ifdef CONFIG_KSU` |
 
 Hook points (verified against `lineage-23.2`):
 
@@ -97,56 +170,66 @@ Hook points (verified against `lineage-23.2`):
 | `drivers/input/input.c` | `input_handle_event` | `ksu_handle_input_handle_event` |
 | `kernel/reboot.c` | `SYSCALL_DEFINE4(reboot)` | `ksu_handle_sys_reboot` |
 
-`kernel/reboot.c` doubles as the marker KernelSU-Next's `Kbuild` greps for
-(`HAVE_KSU_HOOK`).
+`kernel/reboot.c` also serves as the marker KernelSU-Next's `Kbuild` greps for
+(`HAVE_KSU_HOOK`). `drivers/Makefile`, `drivers/Kconfig` and the
+`drivers/kernelsu` symlink are created by `KernelSU-Next/kernel/setup.sh`.
 
-`drivers/Makefile`, `drivers/Kconfig` and the `drivers/kernelsu` symlink are
-created by `KernelSU-Next/kernel/setup.sh` in CI.
+## Scripts
+
+| script | purpose |
+|---|---|
+| `extract_config.py` | pull the embedded `.config` out of a boot image's kernel |
+| `apply_ksu_config.py` | apply the KernelSU delta on top of it |
+| `kmake.sh` | `make` wrapper that always passes clang (see above) |
+| `pin_vermagic.py` | pin `.scmversion` so the release string matches the official one |
+| `patch_ksu_tree.py` | fix the 4.14 `timespec64` build break in KSU `legacy` |
+| `fetch_boot.py` | download the official `boot.img` for the matching build |
+| `repack_boot.py` | reassemble the boot image and re-sign AVB |
+| `artifact_info.py` | read clang build id / release string from an image (CI gate) |
 
 ## Build
 
-Push to `main` or run the workflow manually. Inputs:
+Push to `main`, or run the workflow manually on this branch:
 
-* `ksu_tag` — KernelSU-Next tag. **Must be a `*-legacy` or `1.x` tag.**
-  Default: `v3.2.0-legacy`.
-* `build_ksu` — `false` builds a stock (non-root) kernel for comparison.
+* `ksu_tag` — default `legacy` (recommended). Any `*-legacy` / `1.x` tag also
+  works but will be older.
+* `build_ksu` — `false` builds a stock (non-root) kernel with the same
+  pipeline; useful to isolate whether a problem is KSU-related.
 
 Artifacts:
 
 * `boot-guacamoleb-<ksu>.img` — flashable boot image
-* `kernel-modules-ksu.zip` — KernelSU module with the rebuilt `qca_cld3_wlan.ko`
-  and `gspca_main.ko` (installed over `/vendor/lib/modules`)
+* `kernel-modules-ksu.zip` — KernelSU module with rebuilt `qca_cld3_wlan.ko` /
+  `gspca_main.ko`
 * `Image` — raw kernel
-* `.config` (`out.config`) and full build log
+* `.config` + full build log
 
 ## Install
 
 ```bash
-# 1. boot image (A/B device, current slot)
-fastboot flash boot boot-guacamoleb-v3.2.0-legacy.img
+# 1. boot image (A/B device, active slot)
+fastboot flash boot boot-guacamoleb-*.img
 
-# 2. after the first boot, install the module zip through KernelSU-Next Manager
-#    (Modules -> Install from storage -> kernel-modules-ksu.zip), then reboot.
+# 2. after first boot, install the modules
+#    KernelSU-Next Manager -> Modules -> Install from storage -> kernel-modules-ksu.zip
+#    then reboot
 ```
 
-The module zip is **mandatory**: without the matching `qca_cld3_wlan.ko`,
-Wi-Fi will not come up.
+## Notes
 
-## Important notes
-
-* **Vermagic is pinned.** `LOCALVERSION_AUTO` would append `-g<git-sha>` of the
-  patched HEAD; the workflow pins the official suffix (`-g0521dc291cf1`) via
-  `.scmversion` and fails the build if the release string ever diverges.
-* **KernelSU Manager v3.x** is required (kernel side is `v3.2.0-legacy`).
-* **Re-flash after every OTA.** LineageOS OTA updates the inactive slot; after
+* **KernelSU-Next Manager v3.x** is required.
+* **Re-flash after every OTA.** LineageOS OTA writes the inactive slot; after
   rebooting you are on the other slot and the custom kernel is gone.
 * **SELinux** stays enforcing.
+* For a boot hang, `fastboot boot boot.img` boots without flashing — a crash
+  there leaves no trace on the device, so it is the safe way to test.
 
-## Verified
+## Verified in CI
 
-* boot.img: 100663296 bytes, ramdisk + DTB byte-identical to the official image,
-  AVB footer preserved.
-* kernel release: `4.14.357-openela-perf-g0521dc291cf1` (identical to official).
-* modules vermagic:
-  `4.14.357-openela-perf-g0521dc291cf1 SMP preempt mod_unload modversions aarch64`.
-* `.config` diff vs official: only the KernelSU delta (7 entries).
+* boot.img: 100663296 bytes, ramdisk + DTB byte-identical to the official image
+* release string: `4.14.357-openela-perf-g0521dc291cf1` (identical to official)
+* clang build id: `14054515` (identical to official)
+* `.config` diff vs official: only the KernelSU delta
+* AVB: footer + vbmeta verify successfully
+* module vermagic:
+  `4.14.357-openela-perf-g0521dc291cf1 SMP preempt mod_unload modversions aarch64`
