@@ -1,0 +1,50 @@
+From f3c8e266b2dfd744df93d0caf7e6761d94514a7a Mon Sep 17 00:00:00 2001
+From: guacamoleb CI <ci@localhost>
+Date: Sun, 20 Sep 2026 22:48:17 +0500
+Subject: [PATCH 1/2] guacamoleb: enable KernelSU-Next (legacy, manual hooks)
+ in defconfig
+
+KernelSU-Next (legacy, non-GKI) with manual in-tree hooks.
+
+Hook mode is `manual` because CONFIG_KPROBES is not set on this kernel and
+KernelSU-Next's kprobe/tracepoint hook requires
+KPROBES + KRETPROBES + HAVE_SYSCALL_TRACEPOINTS.
+
+KernelSU-Next must be pinned to a *-legacy tag on 4.14: the mainline `next`
+line (>= v3.3.0) uses syscall_fn_t, which was introduced on arm64 only in
+4.19 and therefore does not compile here.
+
+CONFIG_EXT4_FS, CONFIG_MODULES and CONFIG_KALLSYMS_ALL are already =y in the
+sm8150 perf defconfig. CONFIG_OVERLAY_FS is enabled by that defconfig too;
+only REDIRECT_DIR / XINO_AUTO / TMPFS_XATTR are added here, as KernelSU uses
+overlayfs for Magisk-style module mounting.
+
+---
+ arch/arm64/configs/vendor/sm8150-perf_defconfig | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/arch/arm64/configs/vendor/sm8150-perf_defconfig b/arch/arm64/configs/vendor/sm8150-perf_defconfig
+index f4e51e8..3c55610 100644
+--- a/arch/arm64/configs/vendor/sm8150-perf_defconfig
++++ b/arch/arm64/configs/vendor/sm8150-perf_defconfig
+@@ -723,3 +723,17 @@ CONFIG_CRYPTO_GHASH_ARM64_CE=y
+ CONFIG_CRYPTO_AES_ARM64_CE_CCM=y
+ CONFIG_CRYPTO_AES_ARM64_CE_BLK=y
+ CONFIG_CRYPTO_AES_ARM64_NEON_BLK=y
++
++# ============================================================
++# KernelSU-Next (legacy, non-GKI, manual hooks) — guacamoleb
++# ============================================================
++CONFIG_KSU=y
++# CONFIG_KSU_DEBUG is not set
++# Manual in-tree hooks: CONFIG_KPROBES is not set on sm8150,
++# so the kprobe/tracepoint hook path is unavailable.
++CONFIG_KSU_MANUAL_HOOK=y
++# CONFIG_KSU_KPROBES_HOOK is not set
++# Required for KSU module mounting (Magisk-style overlayfs).
++CONFIG_OVERLAY_FS_REDIRECT_DIR=y
++CONFIG_OVERLAY_FS_XINO_AUTO=y
++CONFIG_TMPFS_XATTR=y
+-- 
+2.55.0
+

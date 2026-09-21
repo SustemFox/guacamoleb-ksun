@@ -1,0 +1,484 @@
+name: Build guacamoleb kernel (KernelSU-Next, non-GKI manual hooks)
+
+# Builds a flashable boot.img for OnePlus 7 (guacamoleb) from the
+# LineageOS 23.2 kernel source with KernelSU-Next compiled in.
+#
+# Hook mode is MANUAL because CONFIG_KPROBES is not set on this kernel.
+# KernelSU-Next tag MUST be a *-legacy (or 1.x) tag: the mainline next
+# line (>= v3.3.0) does not compile on 4.14 (uses syscall_fn_t, arm64 4.19+).
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+    inputs:
+      ksu_tag:
+        description: 'KernelSU-Next tag or branch (legacy = current fixes, recommended)'
+        required: false
+        default: 'legacy'
+      build_ksu:
+        description: 'Include KernelSU-Next'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ARCH: arm64
+  # Config source: the OFFICIAL kernel configuration is extracted from the
+  # ROM's boot.img (see scripts/extract_config.py) and only the KernelSU delta
+  # is applied. No defconfig/fragment merge is used, so the build keeps the
+  # exact compiler options (LTO_CLANG, SHADOW_CALL_STACK, ...) of the ROM.
+  # The official LineageOS boot.img stores an UNCOMPRESSED arm64 Image
+  # (AndroidKernel.mk builds `Image`, BOARD_KERNEL_IMAGE_NAME := Image).
+  KERNEL_IMAGE: Image
+  # avbtool is needed to re-sign the boot image after the kernel changes size.
+  # The embedded vbmeta struct moves when the kernel grows, so the AVB footer
+  # must be rebuilt; otherwise the image fails verification -> boot loop.
+  AVBTOOL_URL: https://android.googlesource.com/platform/external/avb/+/refs/heads/main/avbtool.py?format=TEXT
+  KERNEL_REPO: https://github.com/LineageOS/android_kernel_oneplus_sm8150
+  KERNEL_BRANCH: lineage-23.2
+  # prebuilts/clang/host/linux-x86/clang-r563880 (clang 21.0.0) — the exact
+  # toolchain used for the official LineageOS 23.2 sm8150 kernel.
+  #
+  # Fetched as a tarball from AOSP googlesource rather than cloned from a
+  # GitHub mirror: the mirrors (Aeron-Aeron, bluegreensea, ...) store the
+  # large binaries via git-lfs, so a plain `git clone` gets LFS pointers
+  # instead of ELF executables, and some also lose the executable bit.
+  # r563880c, NOT r563880: the official kernel banner reports clang build
+  # 14054515, which is r563880c. r563880 differs (13783749) and, with LTO +
+  # Shadow Call Stack, can produce an image that hangs early in boot.
+  CLANG_TARBALL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/clang-r563880c.tar.gz
+  GCC64_REPO: https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9
+  GCC64_BRANCH: lineage-19.1
+  GCC32_REPO: https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9
+  GCC32_BRANCH: lineage-19.1
+  KSU_TAG: ${{ github.event.inputs.ksu_tag || 'legacy' }}
+
+jobs:
+  build:
+    name: Build Image + boot.img
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout this repository (patches + scripts)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl device-tree-compiler \
+            flex git kmod libelf-dev libssl-dev lz4 python3 rsync zip zstd
+          sudo ln -sf "$(command -v python3)" /usr/local/bin/python
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # ------------------------------------------------------------------
+      # Layout:
+      #   $GITHUB_WORKSPACE/kernel/     <- srctree (LineageOS sm8150)
+      #   $GITHUB_WORKSPACE/toolchain/  <- clang / gcc prebuilts
+      # ------------------------------------------------------------------
+      # ------------------------------------------------------------------
+      # Fetch the OFFICIAL boot.img early: it provides the pinned vermagic
+      # (step above) and the ramdisk/DTB used for the repack at the end.
+      # ------------------------------------------------------------------
+      - name: Fetch official boot.img
+        run: |
+          set -euxo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/fetch_boot.py" \
+            "${{ vars.BOOT_IMG_URL || 'https://download.lineageos.org/api/v2/devices/guacamoleb/builds' }}" \
+            "$GITHUB_WORKSPACE/official_boot.img"
+
+      - name: Fetch kernel source
+        run: |
+          set -euxo pipefail
+          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
+          cd kernel
+          git log --oneline -1
+          git config user.name  "guacamoleb CI"
+          git config user.email "ci@localhost"
+
+      - name: Apply patch series
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          git am --3way "$GITHUB_WORKSPACE"/patches/*.patch
+          git log --oneline | head -5
+          echo "PATCHES_APPLIED=$(ls "$GITHUB_WORKSPACE"/patches/*.patch | wc -l)" >> "$GITHUB_ENV"
+
+      - name: Cache toolchains
+        id: toolchain-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchain
+          # bump this key whenever CLANG_TARBALL changes, otherwise the old
+          # toolchain is restored from cache and silently used.
+          key: toolchain-clang-r563880c-gcc49-v1
+
+      - name: Fetch toolchains
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/toolchain"
+          cd "$GITHUB_WORKSPACE/toolchain"
+
+          CLANG_DIR="$GITHUB_WORKSPACE/toolchain/clang"
+          GCC64_DIR="$GITHUB_WORKSPACE/toolchain/gcc64"
+          GCC32_DIR="$GITHUB_WORKSPACE/toolchain/gcc32"
+
+          if [ ! -x "$CLANG_DIR/bin/clang" ]; then
+            # clang: AOSP prebuilt tarball (no git-lfs pitfalls). ~1.1 GB.
+            mkdir -p "$CLANG_DIR"
+            curl -L --fail --retry 3 --retry-delay 5 --max-time 900 \
+              "$CLANG_TARBALL" -o clang.tar.gz
+            tar xzf clang.tar.gz -C "$CLANG_DIR"
+            rm -f clang.tar.gz
+          else
+            echo 'clang restored from cache'
+          fi
+
+          # GCC cross toolchains (real files, no lfs).
+          [ -d "$GCC64_DIR" ] || git clone --depth=1 -b "$GCC64_BRANCH" "$GCC64_REPO" gcc64 >/dev/null 2>&1
+          [ -d "$GCC32_DIR" ] || git clone --depth=1 -b "$GCC32_BRANCH" "$GCC32_REPO" gcc32 >/dev/null 2>&1
+
+          echo "CLANG_DIR=$CLANG_DIR" >> "$GITHUB_ENV"
+          echo "GCC64_DIR=$GCC64_DIR" >> "$GITHUB_ENV"
+          echo "GCC32_DIR=$GCC32_DIR" >> "$GITHUB_ENV"
+
+          # be defensive: restore exec bits if the archive lost them
+          chmod -R u+rwX,go+rX "$CLANG_DIR"
+          find "$CLANG_DIR/bin" -maxdepth 1 -type f -exec chmod +x {} +
+
+          # Sanity check the toolchain before the long build.
+          "$CLANG_DIR/bin/clang" --version | head -1
+          "$GCC64_DIR/bin/aarch64-linux-android-gcc" --version | head -1
+          "$GCC32_DIR/bin/arm-linux-androideabi-gcc" --version | head -1
+
+      - name: Set up KernelSU-Next (${{ env.KSU_TAG }})
+        if: ${{ github.event.inputs.build_ksu != 'false' }}
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          curl -LSs \
+            "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+            -o /tmp/ksun-setup.sh
+          bash /tmp/ksun-setup.sh "$KSU_TAG"
+          test -L drivers/kernelsu
+          grep -q 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile
+          grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          # KernelSU-Next's legacy branch does not build on 4.14 out of the
+          # box: sulog/event.c calls get_monotonic_boottime() (which takes
+          # struct timespec here) with a struct timespec64 *. 4.14 already has
+          # ktime_get_boottime_ts64(), so fix the guard.
+          python3 "$GITHUB_WORKSPACE/scripts/patch_ksu_tree.py" KernelSU-Next
+
+          echo "KSU_VERSION=$(git -C KernelSU-Next describe --tags)" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # ------------------------------------------------------------------
+      # Generate .config.
+      #
+      # Start from the OFFICIAL kernel configuration embedded in the ROM's
+      # boot.img (IKCONFIG), not from defconfig + olddefconfig: the official
+      # config carries compiler-specific options (LTO_CLANG, THINLTO,
+      # SHADOW_CALL_STACK, INIT_STACK_ALL_ZERO) that a defconfig run silently
+      # loses. Only the KernelSU delta is applied on top.
+      # ------------------------------------------------------------------
+      - name: Generate .config
+        working-directory: kernel
+        run: |
+          set -uxo pipefail
+          export PATH="$CLANG_DIR/bin:$GCC64_DIR/bin:$GCC32_DIR/bin:$PATH"
+
+          # 1. official config straight out of the shipped kernel
+          python3 "$GITHUB_WORKSPACE/scripts/extract_config.py" \
+            "$GITHUB_WORKSPACE/official_boot.img" /tmp/official.config
+
+          # 2. apply only the KernelSU delta
+          mkdir -p out
+          python3 "$GITHUB_WORKSPACE/scripts/apply_ksu_config.py" \
+            /tmp/official.config out/.config
+
+          # 3. resolve symbols whose dependencies changed (KSU is wired in by
+          #    setup.sh before this step)
+          # NOTE: always go through scripts/kmake.sh. A bare `make` defaults
+          # CC to $(CROSS_COMPILE)gcc, which triggers the kernel's
+          # check-clang-specific-options rule and silently drops
+          # LTO_CLANG / SHADOW_CALL_STACK / INIT_STACK_ALL_ZERO.
+          cp "$GITHUB_WORKSPACE/scripts/kmake.sh" .
+          bash ./kmake.sh olddefconfig > /tmp/olddefconfig.log 2>&1 \
+            || { tail -40 /tmp/olddefconfig.log; exit 2; }
+
+          # --- assertions -------------------------------------------------
+          fail=0
+          for opt in CONFIG_KSU CONFIG_KSU_MANUAL_HOOK CONFIG_OVERLAY_FS \
+                     CONFIG_OVERLAY_FS_REDIRECT_DIR CONFIG_TMPFS_XATTR \
+                     CONFIG_EXT4_FS CONFIG_MODULES CONFIG_KALLSYMS_ALL \
+                     CONFIG_LTO_CLANG CONFIG_SHADOW_CALL_STACK \
+                     CONFIG_INIT_STACK_ALL_ZERO; do
+            grep -q "^${opt}=y" out/.config \
+              || { echo "::error::${opt} is not enabled in .config"; fail=1; }
+          done
+          # built as a module and shipped in the KernelSU module zip
+          grep -q "^CONFIG_QCA_CLD_WLAN=m" out/.config \
+            || { echo "::error::CONFIG_QCA_CLD_WLAN is not =m in .config"; fail=1; }
+          if grep -q '^CONFIG_KSU_KPROBES_HOOK=y' out/.config; then
+            echo "::error::KSU kprobe hook is enabled; expected manual hooks"; fail=1
+          fi
+          for f in fs/exec.c fs/open.c fs/stat.c fs/read_write.c \
+                   kernel/reboot.c drivers/input/input.c; do
+            grep -q 'ksu_handle_' "$f" \
+              || { echo "::error::manual KSU hook missing in $f"; fail=1; }
+          done
+          [ "$fail" -eq 0 ] || exit 1
+
+          cp out/.config "$GITHUB_WORKSPACE/out.config"
+          echo "KERNEL_RELEASE=$(bash ./kmake.sh -s kernelrelease 2>/dev/null | tail -1)" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # Pin vermagic. The stock vendor WLAN module
+      # (/vendor/lib/modules/qca_cld3_wlan.ko) only loads if its vermagic
+      # matches exactly. LOCALVERSION_AUTO would append -g<git-sha> of our
+      # patched HEAD, so we force the official suffix via .scmversion.
+      # ------------------------------------------------------------------
+      - name: Pin vermagic (match official release string)
+        run: |
+          set -euxo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/pin_vermagic.py" \
+            kernel "$GITHUB_WORKSPACE/official_boot.img" kernel/out/.config
+          echo "--- release after pin ---"
+          cd kernel
+          release=$(bash ./kmake.sh -s kernelrelease | tail -1)
+          echo "KERNEL_RELEASE=$release" >> "$GITHUB_ENV"
+          echo "kernel release: $release"
+
+      - name: Build kernel + modules
+        working-directory: kernel
+        run: |
+          set -uxo pipefail
+          export PATH="$GCC64_DIR/bin:$GCC32_DIR/bin:$PATH"
+          export PATH="$PATH:$CLANG_DIR/bin"
+
+          cp "$GITHUB_WORKSPACE/scripts/kmake.sh" .
+
+          # Image AND modules. The WLAN driver (CONFIG_QCA_CLD_WLAN=m) is a
+          # module built from the kernel tree; it lives in /vendor/lib/modules
+          # on-device. CONFIG_MODVERSIONS=y means its symbol CRCs are tied to
+          # this exact build, so the stock module cannot be reused with a
+          # custom kernel. We rebuild and ship them.
+          bash ./kmake.sh -j"$(nproc --all)" "$KERNEL_IMAGE" modules \
+            > "$GITHUB_WORKSPACE/build.log" 2>&1
+          rc=$?
+          tail -40 "$GITHUB_WORKSPACE/build.log"
+          if [ "$rc" -ne 0 ]; then
+            grep -E 'error:|Error [0-9]|undefined (reference|symbol)' \
+              "$GITHUB_WORKSPACE/build.log" | head -30 \
+              | while IFS= read -r line; do echo "::error::build: ${line}"; done
+            exit "$rc"
+          fi
+
+          echo "--- built modules ---"
+          find out -name '*.ko' -type f -printf '%P  (%s bytes)\n' | sort
+          echo "MODULE_COUNT=$(find out -name '*.ko' -type f | wc -l)" >> "$GITHUB_ENV"
+
+      - name: Verify kernel artifacts
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          IMG="out/arch/arm64/boot/${KERNEL_IMAGE}"
+          test -s "$IMG" || { echo "::error::${IMG} was not produced"; exit 1; }
+          ls -lh "$IMG"
+          echo "release: $KERNEL_RELEASE"
+          # Reproduce the official release string byte-for-byte. The stock
+          # vendor modules only load when vermagic matches; we also ship
+          # rebuilt modules, but keeping the release string identical avoids
+          # changing vermagic at all.
+          official=$(python3 "$GITHUB_WORKSPACE/scripts/pin_vermagic.py" --extract-boot "$GITHUB_WORKSPACE/official_boot.img")
+          echo "official release: $official"
+          if [ "$official" != "$KERNEL_RELEASE" ]; then
+            echo "::error::vermagic mismatch: built '$KERNEL_RELEASE' != official '$official'"
+            echo "::error::stock vendor modules (qca_cld3_wlan) will refuse to load"
+            exit 1
+          fi
+          [ "${MODULE_COUNT:-0}" -gt 0 ] || { echo "::error::no kernel modules were built"; exit 1; }
+
+          # Toolchain gate: the official kernel was built with a specific clang
+          # (build id 14054515 = r563880c). A different clang with LTO +
+          # Shadow Call Stack may produce a kernel that hangs early in boot, so
+          # fail loudly instead of shipping it.
+          official_cc=$(python3 "$GITHUB_WORKSPACE/scripts/artifact_info.py" \
+            --clang-build-id "$GITHUB_WORKSPACE/official_boot.img")
+          our_cc=$(python3 "$GITHUB_WORKSPACE/scripts/artifact_info.py" \
+            --clang-build-id "$IMG")
+          echo "official clang build id: $official_cc"
+          echo "our clang build id     : $our_cc"
+          if [ "$official_cc" != "$our_cc" ]; then
+            echo "::error::clang build id mismatch: '$our_cc' != official '$official_cc'"
+            echo "::error::toolchain cache may be stale (bump the cache key) or CLANG_TARBALL is wrong"
+            exit 1
+          fi
+
+      # ------------------------------------------------------------------
+      # Repack boot.img: keep the OFFICIAL ramdisk + DTB, swap in our kernel,
+      # and RE-SIGN the AVB footer.
+      #
+      # AVB must be rebuilt: the embedded vbmeta struct sits right after the
+      # kernel/ramdisk/DTB body, so a larger kernel moves it, and the footer at
+      # the end of the image would point at stale bytes. The image then fails
+      # verification and the device can boot-loop. avbtool re-creates the
+      # footer/vbmeta using the salt, properties and sizes of the original.
+      # ------------------------------------------------------------------
+      - name: Fetch avbtool
+        run: |
+          set -euxo pipefail
+          # googlesource serves the file base64-encoded (?format=TEXT)
+          curl -L --fail --retry 3 --max-time 120 "$AVBTOOL_URL" -o /tmp/avbtool.b64
+          python3 -c "import base64, pathlib; raw = base64.b64decode(pathlib.Path('/tmp/avbtool.b64').read_bytes()); pathlib.Path('/tmp/avbtool.py').write_bytes(raw); print('avbtool.py:', len(raw), 'bytes')"
+          python3 /tmp/avbtool.py version
+
+      - name: Repack boot image (with AVB re-sign)
+        run: |
+          set -euxo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/repack_boot.py" \
+            "kernel/out/arch/arm64/boot/${KERNEL_IMAGE}" \
+            "$GITHUB_WORKSPACE/official_boot.img" \
+            "$GITHUB_WORKSPACE/boot-guacamoleb-${KSU_VERSION:-noksu}.img" \
+            /tmp/avbtool.py
+          ls -lh "$GITHUB_WORKSPACE"/boot-guacamoleb-*.img
+
+          # hard gate: the image MUST verify, otherwise it can boot-loop
+          mkdir -p /tmp/avbcheck
+          cp "$GITHUB_WORKSPACE"/boot-guacamoleb-*.img /tmp/avbcheck/boot.img
+          python3 /tmp/avbtool.py verify_image --image /tmp/avbcheck/boot.img
+
+          echo "--- final AVB layout ---"
+          python3 /tmp/avbtool.py info_image \
+            --image "$GITHUB_WORKSPACE"/boot-guacamoleb-*.img | head -20
+
+      - name: Upload boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-guacamoleb-${{ env.KSU_VERSION }}
+          path: boot-guacamoleb-*.img
+          if-no-files-found: error
+          retention-days: 30
+
+      # ------------------------------------------------------------------
+      # Package the rebuilt kernel modules as a KernelSU module.
+      #
+      # CONFIG_QCA_CLD_WLAN=m (and CONFIG_USB_GSPCA=m) are built from the kernel
+      # tree and shipped in /vendor/lib/modules. CONFIG_MODVERSIONS=y ties their
+      # symbol CRCs to this exact build, so the STOCK modules will refuse to
+      # load against our kernel (vermagic/CRC mismatch -> no WiFi).
+      #
+      # These rebuilt modules are installed by KSU's magic mount over the
+      # /vendor copies, so /vendor itself stays untouched (AVB-safe).
+      # ------------------------------------------------------------------
+      - name: Package kernel modules as KernelSU module
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          # KernelSU module layout: module.prop and system/ must sit at the ZIP
+          # ROOT. `<root>/system/vendor/lib/modules/*.ko` is then magic-mounted
+          # over /vendor/lib/modules by KernelSU / the metamodule.
+          #
+          # The qcacld driver is built as `wlan.ko` but init loads it as
+          # `qca_cld3_wlan.ko` (init.target.rc: insmod /vendor/lib/modules/
+          # qca_cld3_wlan.ko). LineageOS performs the same rename via
+          # TARGET_MODULE_ALIASES ("wlan.ko:qca_cld3_wlan.ko").
+          MODROOT="$GITHUB_WORKSPACE/ksu-module"
+          rm -rf "$MODROOT"
+          mkdir -p "$MODROOT/system/vendor/lib/modules"
+
+          cp "$(find out -name 'wlan.ko' -type f | head -1)" \
+             "$MODROOT/system/vendor/lib/modules/qca_cld3_wlan.ko"
+          cp "$(find out -name 'gspca_main.ko' -type f | head -1)" \
+             "$MODROOT/system/vendor/lib/modules/gspca_main.ko"
+
+          # KernelSU expects both system/vendor/... and a top-level `vendor`
+          # symlink to system/vendor (its magic mount maps /vendor through it).
+          ln -sf system/vendor "$MODROOT/vendor"
+          ls -l "$MODROOT" "$MODROOT/system/vendor/lib/modules/"
+
+          cat > "$MODROOT/module.prop" <<EOF
+          id=guacamoleb_kernel_modules
+          name=guacamoleb kernel modules (KernelSU)
+          version=$(date -u +%Y%m%d)
+          versionCode=$(date -u +%Y%m%d)
+          author=guacamoleb CI
+          description=Rebuilt kernel modules (qca_cld3_wlan, gspca_main) built from the same tree/config as the custom kernel.
+          EOF
+
+          cat > "$MODROOT/post-fs-data.sh" <<'SH'
+          #!/system/bin/sh
+          MODDIR=${0%/*}
+          # The modules only load on a matching kernel; KernelSU's magic mount
+          # overlays them onto /vendor/lib/modules.
+          SH
+          chmod 755 "$MODROOT/post-fs-data.sh"
+
+          # zip from inside MODROOT so module.prop is at the archive root.
+          # -y keeps the `vendor` symlink instead of expanding it into a
+          # duplicate copy of every .ko.
+          ( cd "$MODROOT" && zip -r9y "$GITHUB_WORKSPACE/kernel-modules-ksu.zip" . -x '.*' )
+          unzip -l "$GITHUB_WORKSPACE/kernel-modules-ksu.zip"
+
+      - name: Upload KernelSU module
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-modules-ksu
+          path: kernel-modules-ksu.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload raw kernel image
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-${{ github.sha }}
+          path: kernel/out/arch/arm64/boot/Image
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload .config and build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-and-log-${{ github.sha }}
+          path: |
+            kernel/out/.config
+            build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## guacamoleb kernel (KernelSU-Next)"
+            echo
+            echo "| item | value |"
+            echo "|---|---|"
+            echo "| device | OnePlus 7 (guacamoleb) |"
+            echo "| ROM | LineageOS 23.2 ($KERNEL_BRANCH) |"
+            echo "| kernel release | \`${KERNEL_RELEASE:-n/a}\` |"
+            echo "| config | official IKCONFIG + KernelSU delta |"
+            echo "| patches | \`${PATCHES_APPLIED:-0}\` |"
+            echo "| KernelSU-Next | \`${KSU_VERSION:-not included}\` |"
+            echo "| hook mode | \`manual (non-GKI)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
