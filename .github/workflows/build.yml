@@ -211,6 +211,11 @@ jobs:
           python3 "$GITHUB_WORKSPACE/scripts/apply_ksu_config.py" \
             /tmp/official.config out/.config
 
+          # Build the Qualcomm WLAN driver into the kernel. This removes the
+          # runtime dependency on qca_cld3_wlan.ko and lets Wi-Fi work without
+          # installing the KSU modules ZIP.
+          sed -i 's/^CONFIG_QCA_CLD_WLAN=m$/CONFIG_QCA_CLD_WLAN=y/' out/.config
+
           # 3. resolve symbols whose dependencies changed (KSU is wired in by
           #    setup.sh before this step)
           # NOTE: always go through scripts/kmake.sh. A bare `make` defaults
@@ -231,9 +236,9 @@ jobs:
             grep -q "^${opt}=y" out/.config \
               || { echo "::error::${opt} is not enabled in .config"; fail=1; }
           done
-          # built as a module and shipped in the KernelSU module zip
-          grep -q "^CONFIG_QCA_CLD_WLAN=m" out/.config \
-            || { echo "::error::CONFIG_QCA_CLD_WLAN is not =m in .config"; fail=1; }
+          # Built into vmlinux; no qca_cld3_wlan.ko is needed at runtime.
+          grep -q "^CONFIG_QCA_CLD_WLAN=y" out/.config \
+            || { echo "::error::CONFIG_QCA_CLD_WLAN is not =y in .config"; fail=1; }
           if grep -q '^CONFIG_KSU_KPROBES_HOOK=y' out/.config; then
             echo "::error::KSU kprobe hook is enabled; expected manual hooks"; fail=1
           fi
@@ -272,11 +277,8 @@ jobs:
 
           cp "$GITHUB_WORKSPACE/scripts/kmake.sh" .
 
-          # Image AND modules. The WLAN driver (CONFIG_QCA_CLD_WLAN=m) is a
-          # module built from the kernel tree; it lives in /vendor/lib/modules
-          # on-device. CONFIG_MODVERSIONS=y means its symbol CRCs are tied to
-          # this exact build, so the stock module cannot be reused with a
-          # custom kernel. We rebuild and ship them.
+          # Image and the remaining modules. qca_cld3_wlan is built into the
+          # kernel; gspca_main remains a separate module.
           bash ./kmake.sh -j"$(nproc --all)" "$KERNEL_IMAGE" modules \
             > "$GITHUB_WORKSPACE/build.log" 2>&1
           rc=$?
@@ -397,12 +399,12 @@ jobs:
           # `qca_cld3_wlan.ko` (init.target.rc: insmod /vendor/lib/modules/
           # qca_cld3_wlan.ko). LineageOS performs the same rename via
           # TARGET_MODULE_ALIASES ("wlan.ko:qca_cld3_wlan.ko").
+          # qca_cld3_wlan is built into the kernel, so only gspca_main.ko is
+          # packaged. The ZIP is optional for Wi-Fi in this variant.
           MODROOT="$GITHUB_WORKSPACE/ksu-module"
           rm -rf "$MODROOT"
           mkdir -p "$MODROOT/system/vendor/lib/modules"
 
-          cp "$(find out -name 'wlan.ko' -type f | head -1)" \
-             "$MODROOT/system/vendor/lib/modules/qca_cld3_wlan.ko"
           cp "$(find out -name 'gspca_main.ko' -type f | head -1)" \
              "$MODROOT/system/vendor/lib/modules/gspca_main.ko"
 
