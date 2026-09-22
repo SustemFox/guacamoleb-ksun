@@ -80,7 +80,8 @@ def main():
 
     selinux_src = open(selinux_path, encoding='utf-8').read()
     old_hook = '\thook_selinux_transaction_write();'
-    new_hook = ('\t/* Android writes /sys/fs/selinux/context while setting a '\n                'zygote child context. Do not intercept this path. */\n'
+    new_hook = ('\t/* Android writes /sys/fs/selinux/context while setting a\n'
+                '\t * zygote child context. Do not intercept this path. */\n'
                 '\t/* hook_selinux_transaction_write(); */')
     if old_hook in selinux_src:
         selinux_src = selinux_src.replace(old_hook, new_hook, 1)
