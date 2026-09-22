@@ -28,6 +28,11 @@ zygote child's SELinux context, causing a userspace crash-loop on Android 16.
 The patch leaves the remaining SELinux status-hide feature intact but does not
 install that unsafe write hook.
 
+Finally, current legacy stores app profiles as ABI v4 while the matching
+v3.2.0 Manager sends ABI v3. The only v4 addition is `root_profile.flags` at
+the end of the structure. The compatibility shim clears that new field and
+migrates v3 to v4 before validation, preserving the established Manager ABI.
+
 Usage:
     patch_ksu_tree.py <KernelSU-Next-dir>   (i.e. kernel/KernelSU-Next)
 """
@@ -91,6 +96,30 @@ def main():
         print('patch_ksu_tree: SELinux context-write hook already disabled')
     else:
         print('patch_ksu_tree: WARNING: SELinux hook call not found', file=sys.stderr)
+        return 1
+    profile_path = os.path.join(ksu_dir, 'kernel/policy/allowlist.c')
+    profile_src = open(profile_path, encoding='utf-8').read()
+    old_setter = """int ksu_set_app_profile(struct app_profile *profile)
+{
+    struct perm_data *p = NULL, *np;"""
+    new_setter = """int ksu_set_app_profile(struct app_profile *profile)
+{
+    /* v3 Manager profiles predate root_profile.flags (v4). The field is at
+     * the end of the root union member, so zero it before ABI migration. */
+    if (profile && profile->version == 3) {
+        profile->rp_config.profile.flags = 0;
+        profile->version = KSU_APP_PROFILE_VER;
+    }
+
+    struct perm_data *p = NULL, *np;"""
+    if old_setter in profile_src:
+        profile_src = profile_src.replace(old_setter, new_setter, 1)
+        open(profile_path, 'w', encoding='utf-8').write(profile_src)
+        print('patch_ksu_tree: migrated Manager app profile ABI v3 to v4')
+    elif new_setter in profile_src:
+        print('patch_ksu_tree: Manager app profile ABI shim already applied')
+    else:
+        print('patch_ksu_tree: WARNING: app profile setter not found', file=sys.stderr)
         return 1
     return 0
 
