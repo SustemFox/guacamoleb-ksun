@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Fix KernelSU-Next `legacy` build on Linux 4.14.
+Fix KernelSU-Next `legacy` build on Linux 4.14 and disable its unsafe
+SELinux context-write hook.
 
 `kernel/sulog/event.c` guards the timestamp call with:
 
@@ -20,6 +21,12 @@ Meanwhile `ktime_get_boottime_ts64()` already exists on 4.14
 (include/linux/timekeeping.h), so the guard is simply wrong for this tree.
 
 This script rewrites those blocks to always use the ts64 helper.
+
+Recent `legacy` also installs a hook on `/sys/fs/selinux/context` that rejects
+all writes from app UIDs. Android itself writes this node while assigning a
+zygote child's SELinux context, causing a userspace crash-loop on Android 16.
+The patch leaves the remaining SELinux status-hide feature intact but does not
+install that unsafe write hook.
 
 Usage:
     patch_ksu_tree.py <KernelSU-Next-dir>   (i.e. kernel/KernelSU-Next)
@@ -65,6 +72,25 @@ def main():
     src = src.replace(OLD, NEW)
     open(path, 'w', encoding='utf-8').write(src)
     print('patch_ksu_tree: fixed %d timespec64 block(s) in %s' % (n, path))
+
+    selinux_path = os.path.join(ksu_dir, 'kernel/feature/selinux_hide.c')
+    if not os.path.exists(selinux_path):
+        print('patch_ksu_tree: selinux_hide not present, skipping')
+        return 0
+
+    selinux_src = open(selinux_path, encoding='utf-8').read()
+    old_hook = '\thook_selinux_transaction_write();'
+    new_hook = ('\t/* Android writes /sys/fs/selinux/context while setting a '\n                'zygote child context. Do not intercept this path. */\n'
+                '\t/* hook_selinux_transaction_write(); */')
+    if old_hook in selinux_src:
+        selinux_src = selinux_src.replace(old_hook, new_hook, 1)
+        open(selinux_path, 'w', encoding='utf-8').write(selinux_src)
+        print('patch_ksu_tree: disabled unsafe SELinux context-write hook')
+    elif new_hook in selinux_src:
+        print('patch_ksu_tree: SELinux context-write hook already disabled')
+    else:
+        print('patch_ksu_tree: WARNING: SELinux hook call not found', file=sys.stderr)
+        return 1
     return 0
 
 
