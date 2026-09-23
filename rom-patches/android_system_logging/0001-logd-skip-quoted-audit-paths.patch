@@ -1,0 +1,21 @@
+diff --git a/logd/LogAudit.cpp b/logd/LogAudit.cpp
+index 0000000..0000000 100644
+--- a/logd/LogAudit.cpp
++++ b/logd/LogAudit.cpp
+@@ -220,8 +220,15 @@ void LogAudit::logDecodedPath(const std::string& denial) {
+     // android::base::HexToBytes() does further validation to ensure that the path is indeed a hex
+     // string.
+     std::string path = denialParse(denial, ' ', "path=");
++    // Normal kernel paths are quoted (for example, path="/proc/keys"). They
++    // are already printable and must not be passed to HexToBytes(); doing so
++    // emits one ERROR log for every ordinary AVC record.
++    if (path.empty() || path.front() == '"' || path.back() == '"') {
++        return;
++    }
++
+     std::vector<uint8_t> bytes;
+-    if (path.empty() || !android::base::HexToBytes(path, &bytes)) {
++    if (!android::base::HexToBytes(path, &bytes)) {
+         return;
+     }
+ 

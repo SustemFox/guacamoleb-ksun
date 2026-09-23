@@ -22,6 +22,7 @@ Rules (see the log evidence they target):
   oplus_charger.c
     " fastchg status[...] charger info[...]" + oplus_vooc_print_log(): the
     periodic fast-charge state dump in oplus_check_afi_update_condition().
+    Its remaining `true 3: normal charger...` branch message is also silenced.
     "[%s] will (not) call oplus_gauge_protect_check": per-poll printk(KERN_ERR).
     "batt_temp=...shell_temp=...chging_temp=...": per-poll charger_xlog_printk.
     oplus_chg_print_log(chip): full charger/gauge register dump every cycle.
@@ -93,6 +94,11 @@ RULES = [
         'drivers/power/oplus/oplus_vooc.c',
         'vooc_xlog_printk(CHG_LOG_CRTI, "VOOC[ %d / %d / %d / %d / %d / %d]\\n",',
         'if (0) vooc_xlog_printk(CHG_LOG_CRTI, "VOOC[ %d / %d / %d / %d / %d / %d]\\n",',
+    ),
+    (
+        'drivers/power/oplus/oplus_charger.c',
+        'chg_err(" true 3: ormal charger or others unkown\\n");',
+        'if (0) chg_err(" true 3: ormal charger or others unkown\\n");',
     ),
 
     # --- sched_clock: unconditional pr_info on EVERY suspend/resume -------
