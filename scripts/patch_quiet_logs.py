@@ -94,6 +94,21 @@ RULES = [
         'vooc_xlog_printk(CHG_LOG_CRTI, "VOOC[ %d / %d / %d / %d / %d / %d]\\n",',
         'if (0) vooc_xlog_printk(CHG_LOG_CRTI, "VOOC[ %d / %d / %d / %d / %d / %d]\\n",',
     ),
+
+    # --- sched_clock: unconditional pr_info on EVERY suspend/resume -------
+    # kernel/time/sched_clock.c prints two lines per system suspend even in
+    # production, so any suspend/resume burst floods the ring buffer. These
+    # are pure diagnostics (epoch ns/cycles), so demote them to pr_debug.
+    (
+        'kernel/time/sched_clock.c',
+        'pr_info("suspend ns:%17llu',
+        'pr_debug("suspend ns:%17llu',
+    ),
+    (
+        'kernel/time/sched_clock.c',
+        'pr_info("resume cycles:%17llu\\n"',
+        'pr_debug("resume cycles:%17llu\\n"',
+    ),
 ]
 
 
