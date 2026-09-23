@@ -128,6 +128,15 @@ jobs:
           git log --oneline | head -5
           echo "PATCHES_APPLIED=$(ls "$GITHUB_WORKSPACE"/patches/*.patch | wc -l)" >> "$GITHUB_ENV"
 
+      # Silence purely informational vendor messages (haptics, Oplus charger
+      # periodic dumps) that are logged at KERN_ERR and flood logd. Only debug
+      # lines are demoted/silenced; real failures are left untouched.
+      - name: Reduce vendor log noise
+        working-directory: kernel
+        run: |
+          set -euxo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/patch_quiet_logs.py" "$PWD"
+
       - name: Cache toolchains
         id: toolchain-cache
         uses: actions/cache@v4
