@@ -364,7 +364,7 @@ jobs:
           python3 "$GITHUB_WORKSPACE/scripts/repack_boot.py" \
             "kernel/out/arch/arm64/boot/${KERNEL_IMAGE}" \
             "$GITHUB_WORKSPACE/official_boot.img" \
-            "$GITHUB_WORKSPACE/boot-guacamoleb-${KSU_VERSION:-noksu}.img" \
+            "$GITHUB_WORKSPACE/boot-guacamoleb-${KSU_VERSION:-noksu}-build-${GITHUB_RUN_NUMBER}.img" \
             /tmp/avbtool.py
           ls -lh "$GITHUB_WORKSPACE"/boot-guacamoleb-*.img
 
@@ -380,7 +380,7 @@ jobs:
       - name: Upload boot.img
         uses: actions/upload-artifact@v4
         with:
-          name: boot-guacamoleb-${{ env.KSU_VERSION }}
+          name: boot-guacamoleb-${{ env.KSU_VERSION }}-build-${{ github.run_number }}
           path: boot-guacamoleb-*.img
           if-no-files-found: error
           retention-days: 30
@@ -442,21 +442,21 @@ jobs:
           # zip from inside MODROOT so module.prop is at the archive root.
           # -y keeps the `vendor` symlink instead of expanding it into a
           # duplicate copy of every .ko.
-          ( cd "$MODROOT" && zip -r9y "$GITHUB_WORKSPACE/kernel-modules-ksu.zip" . -x '.*' )
-          unzip -l "$GITHUB_WORKSPACE/kernel-modules-ksu.zip"
+          ( cd "$MODROOT" && zip -r9y "$GITHUB_WORKSPACE/kernel-modules-ksu-build-${GITHUB_RUN_NUMBER}.zip" . -x '.*' )
+          unzip -l "$GITHUB_WORKSPACE/kernel-modules-ksu-build-${GITHUB_RUN_NUMBER}.zip"
 
       - name: Upload KernelSU module
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-modules-ksu
-          path: kernel-modules-ksu.zip
+          name: kernel-modules-ksu-build-${{ github.run_number }}
+          path: kernel-modules-ksu-build-${{ github.run_number }}.zip
           if-no-files-found: error
           retention-days: 30
 
       - name: Upload raw kernel image
         uses: actions/upload-artifact@v4
         with:
-          name: Image-${{ github.sha }}
+          name: Image-${{ github.sha }}-build-${{ github.run_number }}
           path: kernel/out/arch/arm64/boot/Image
           if-no-files-found: error
           retention-days: 30
@@ -465,7 +465,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: config-and-log-${{ github.sha }}
+          name: config-and-log-${{ github.sha }}-build-${{ github.run_number }}
           path: |
             kernel/out/.config
             build.log
@@ -480,6 +480,7 @@ jobs:
             echo
             echo "| item | value |"
             echo "|---|---|"
+            echo "| CI build | \\`${GITHUB_RUN_NUMBER}\\` |"
             echo "| device | OnePlus 7 (guacamoleb) |"
             echo "| ROM | LineageOS 23.2 ($KERNEL_BRANCH) |"
             echo "| kernel release | \`${KERNEL_RELEASE:-n/a}\` |"
